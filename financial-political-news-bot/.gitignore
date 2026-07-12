@@ -1,0 +1,13 @@
+# Environment secrets
+.env
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Virtual environment
+venv/
+
+# Runtime data
+history.json
