@@ -99,11 +99,3 @@ bot-tel/
 - **python-dotenv** — Environment variable management
 
 ---
-
-## 📜 License
-
-MIT License — see individual project folders for details.
-
----
-
-**Maintainer:** [MatinSenPaii](https://github.com/MatinSenPaii)
