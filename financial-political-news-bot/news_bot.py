@@ -1,15 +1,47 @@
 import os
 import sys
-import requests
 import json
+import logging
+import re
+import time
+import socket
+from datetime import datetime, timezone, timedelta
+
+import requests
 import feedparser
 import google.generativeai as genai
 from dotenv import load_dotenv
-from datetime import datetime, timedelta
-import re
-import time
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
-# Load env variables
+# ─── Logging Setup ───────────────────────────────────────────────────────────
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+logger = logging.getLogger(__name__)
+
+# ─── Proxy Detection ─────────────────────────────────────────────────────────
+def _proxy_is_available(host="127.0.0.1", port=10808, timeout=1):
+    """Check if a proxy is actually reachable before using it."""
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except (OSError, socket.timeout):
+        return False
+
+
+if _proxy_is_available():
+    os.environ["HTTPS_PROXY"] = "http://127.0.0.1:10808"
+    os.environ["HTTP_PROXY"] = "http://127.0.0.1:10808"
+    logger.info("Proxy detected at 127.0.0.1:10808 — using it")
+else:
+    os.environ.pop("HTTPS_PROXY", None)
+    os.environ.pop("HTTP_PROXY", None)
+    logger.info("No proxy detected — connecting directly")
+
+# ─── Load env variables ──────────────────────────────────────────────────────
 load_dotenv()
 
 # ─── Configuration ───────────────────────────────────────────────────────────
@@ -30,16 +62,26 @@ def validate_env():
     if not TELEGRAM_CHAT_ID:
         missing.append("TELEGRAM_CHAT_ID")
     if missing:
-        print(f"ERROR: Missing required environment variables: {', '.join(missing)}")
-        print("Please create a .env file or set them in your environment.")
-        print("See .env.example for the required format.")
+        logger.error(f"Missing required environment variables: {', '.join(missing)}")
+        logger.error("Please create a .env file or set them in your environment.")
+        logger.error("See .env.example for the required format.")
         sys.exit(1)
 
 validate_env()
 
 # ─── Gemini Setup ────────────────────────────────────────────────────────────
 genai.configure(api_key=GEMINI_API_KEY)
-model = genai.GenerativeModel("gemini-1.5-flash")
+model = genai.GenerativeModel("gemini-3.1-flash-lite")
+
+# ─── HTTP Session with Retry ─────────────────────────────────────────────────
+http_session = requests.Session()
+retry_strategy = Retry(
+    total=3,
+    backoff_factor=1,
+    status_forcelist=[429, 500, 502, 503, 504],
+)
+http_session.mount("https://", HTTPAdapter(max_retries=retry_strategy))
+http_session.mount("http://", HTTPAdapter(max_retries=retry_strategy))
 
 
 # ─── Utility Functions ───────────────────────────────────────────────────────
@@ -48,11 +90,11 @@ def to_persian_num(n):
     if n is None:
         return "N/A"
     try:
-        val = int(float(str(n).replace(',', '')))
+        val = int(float(str(n).replace(",", "")))
         formatted = f"{val:,}"
     except (ValueError, TypeError):
         return str(n)
-        
+
     persian_digits = {
         "0": "۰", "1": "۱", "2": "۲", "3": "۳", "4": "۴",
         "5": "۵", "6": "۶", "7": "۷", "8": "۸", "9": "۹",
@@ -67,6 +109,84 @@ def format_price(value, currency="تومان"):
     return f"{to_persian_num(value)} {currency}"
 
 
+# ─── News Category Classification (Keyword-Based) ───────────────────────────
+NEWS_CATEGORIES = {
+    "🌍 سیاست خارجی و بین‌الملل": {
+        "keywords": [
+            "nuclear", "هسته", "مذاکر", "برجام", "jcpoa", "sanction",
+            "تحریم", "diplomacy", "دیپلماسی", "summit", "نشست",
+            "treaty", "توافق", "nato", "ناتو", "united nations",
+            "سازمان ملل", "foreign", "خارجی", "ambassador", "سفیر",
+            "bilateral", "multilateral", "geopolitic", "international",
+            "بین‌المللی", "war", "جنگ", "peace", "صلح", "conflict",
+            "منازعه", "ceasefire", "آتش‌بس", "ukraine", "اوکراین",
+            "gaza", "غزه", "israel", "اسرائیل", "palestine", "فلسطین",
+        ],
+        "emoji": "🌍",
+    },
+    "🏛️ سیاست داخلی": {
+        "keywords": [
+            "مجلس", "parliament", "election", "انتخابات", "رئیس‌جمهور",
+            "president", "دولت", "government", "وزیر", "minister",
+            "قانون", "law", "اعتراض", "protest", "بازداشت", "arrest",
+            "دادگاه", "court", "حکم", "verdict", "رهبر", "leader",
+            "سپاه", "irgc", "بسیج", "شورای نگهبان", "guardian council",
+            "reform", "اصلاح", "conservative", "محافظه‌کار",
+        ],
+        "emoji": "🏛️",
+    },
+    "💹 اقتصاد و بازار": {
+        "keywords": [
+            "economy", "اقتصاد", "inflation", "تورم", "gdp",
+            "budget", "بودجه", "trade", "تجارت", "export", "صادرات",
+            "import", "واردات", "oil", "نفت", "opec", "اوپک",
+            "stock", "بورس", "market", "بازار", "bank", "بانک",
+            "currency", "ارز", "subsidy", "یارانه", "tax", "مالیات",
+            "unemployment", "بیکاری", "growth", "رشد",
+        ],
+        "emoji": "💹",
+    },
+    "🔬 علم و فناوری": {
+        "keywords": [
+            "technology", "فناوری", "science", "علم", "internet",
+            "اینترنت", "cyber", "سایبر", "satellite", "ماهواره",
+            "nuclear energy", "انرژی هسته‌ای", "research", "پژوهش",
+            "innovation", "نوآوری", "ai", "هوش مصنوعی", "space",
+            "فضا", "startup", "استارتاپ",
+        ],
+        "emoji": "🔬",
+    },
+    "👥 اجتماعی و حقوق بشر": {
+        "keywords": [
+            "human rights", "حقوق بشر", "women", "زنان", "freedom",
+            "آزادی", "journalist", "روزنامه‌نگار", "media", "رسانه",
+            "refugee", "پناهنده", "immigration", "مهاجرت",
+            "execution", "اعدام", "prison", "زندان", "activist",
+            "فعال", "ngo", "civil society", "جامعه مدنی",
+        ],
+        "emoji": "👥",
+    },
+}
+
+
+def classify_political_news(title, source_name):
+    """Classify a political news item into a category using keyword matching.
+
+    Returns (category_name, emoji) or ("📰 سایر اخبار", "📰") as fallback.
+    """
+    text = f"{title}".lower()
+    scores = {}
+    for cat_name, cat_info in NEWS_CATEGORIES.items():
+        score = sum(1 for kw in cat_info["keywords"] if kw in text)
+        if score > 0:
+            scores[cat_name] = score
+
+    if scores:
+        best = max(scores, key=scores.get)
+        return best, NEWS_CATEGORIES[best]["emoji"]
+    return "📰 سایر اخبار", "📰"
+
+
 # ─── CoinGecko Crypto Data ──────────────────────────────────────────────────
 def get_crypto_data():
     """Fetches real crypto prices and 24h changes from CoinGecko API."""
@@ -79,11 +199,11 @@ def get_crypto_data():
             "&sparkline=false"
             "&price_change_percentage=24h,7d"
         )
-        response = requests.get(url, timeout=15)
+        response = http_session.get(url, timeout=15)
         if response.status_code == 429:
-            print("CoinGecko rate limited (429). Waiting 30s and retrying...")
+            logger.warning("CoinGecko rate limited (429). Waiting 30s and retrying...")
             time.sleep(30)
-            response = requests.get(url, timeout=15)
+            response = http_session.get(url, timeout=15)
         response.raise_for_status()
         data = response.json()
         result = {}
@@ -96,10 +216,10 @@ def get_crypto_data():
             }
         return result
     except requests.exceptions.RequestException as e:
-        print(f"Error fetching crypto data: {e}")
+        logger.error(f"Error fetching crypto data: {e}")
         return {}
     except (KeyError, json.JSONDecodeError, TypeError) as e:
-        print(f"Error parsing crypto data: {e}")
+        logger.error(f"Error parsing crypto data: {e}")
         return {}
 
 
@@ -116,7 +236,7 @@ def get_iran_market_data():
     result = {"USD": None, "Gold18k": None, "Seke": None}
 
     try:
-        resp = requests.get(
+        resp = http_session.get(
             "https://www.tgju.org/",
             headers=headers,
             timeout=15,
@@ -162,15 +282,12 @@ def get_iran_market_data():
             if m:
                 result["Seke"] = int(m.group(1).replace(",", ""))
 
-    except Exception as e:
-        print(f"Error scraping TGJU: {e}")
+    except requests.exceptions.RequestException as e:
+        logger.error(f"Error scraping TGJU: {e}")
 
-    if result["USD"] is None:
-        print("Warning: Could not scrape USD price from TGJU.")
-    if result["Gold18k"] is None:
-        print("Warning: Could not scrape Gold price from TGJU.")
-    if result["Seke"] is None:
-        print("Warning: Could not scrape Seke price from TGJU.")
+    for key in ["USD", "Gold18k", "Seke"]:
+        if result[key] is None:
+            logger.warning(f"Could not scrape {key} price from TGJU.")
 
     return result
 
@@ -180,14 +297,14 @@ def get_nobitex_usd():
     """Fetch USDT/IRT price from Nobitex API. Returns Toman price or None."""
     try:
         url = "https://api.nobitex.ir/v2/orderbook/USDTIRT"
-        resp = requests.get(url, timeout=10)
+        resp = http_session.get(url, timeout=10)
         resp.raise_for_status()
         data = resp.json()
         if data.get("status") == "ok":
             price = data.get("lastTradePrice")
             if price:
                 return int(float(price))
-    except Exception:
+    except requests.exceptions.RequestException:
         pass  # Silently ignore — Nobitex may be unreachable in some regions
     return None
 
@@ -203,10 +320,10 @@ def update_history(current_data):
                 if content:
                     history = json.loads(content)
         except (json.JSONDecodeError, OSError) as e:
-            print(f"Warning: Could not read history file: {e}")
+            logger.warning(f"Could not read history file: {e}")
             history = {}
 
-    today_str = datetime.now().strftime("%Y-%m-%d")
+    today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     history[today_str] = current_data
 
     dates = sorted(history.keys(), reverse=True)
@@ -218,10 +335,10 @@ def update_history(current_data):
         with open(HISTORY_FILE, "w", encoding="utf-8") as f:
             json.dump(history, f, ensure_ascii=False, indent=2)
     except OSError as e:
-        print(f"Warning: Could not write history file: {e}")
+        logger.warning(f"Could not write history file: {e}")
 
-    yesterday_str = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
-    last_week_str = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d")
+    yesterday_str = (datetime.now(timezone.utc) - timedelta(days=1)).strftime("%Y-%m-%d")
+    last_week_str = (datetime.now(timezone.utc) - timedelta(days=7)).strftime("%Y-%m-%d")
 
     comparisons = {}
     for key in current_data:
@@ -242,7 +359,7 @@ def format_trend(current, previous):
         percent = (diff / float(previous)) * 100
         emoji = "📈" if diff >= 0 else "📉"
         return f"{emoji} {abs(percent):.1f}%"
-    except:
+    except (ValueError, TypeError, ZeroDivisionError):
         return ""
 
 
@@ -312,14 +429,14 @@ def fetch_political_news():
     ]
     news = []
     seen = set()
-    now = datetime.utcnow()
-    
+    now = datetime.now(timezone.utc)
+
     for name, url in feeds:
         try:
             feed = feedparser.parse(url)
             for entry in feed.entries[:10]:
                 title = entry.title.strip()
-                
+
                 if name in ("Al Jazeera", "Reuters"):
                     if "iran" not in title.lower() and "iran" not in entry.get("summary", "").lower():
                         continue
@@ -328,12 +445,12 @@ def fetch_political_news():
                 if title_key not in seen:
                     time_ago_str = "نامشخص"
                     if hasattr(entry, "published_parsed") and entry.published_parsed:
-                        pub_dt = datetime(*entry.published_parsed[:6])
+                        pub_dt = datetime(*entry.published_parsed[:6], tzinfo=timezone.utc)
                         diff = now - pub_dt
-                        
+
                         hours = diff.seconds // 3600
                         minutes = (diff.seconds % 3600) // 60
-                        
+
                         if diff.days > 0:
                             time_ago_str = f"{to_persian_num(diff.days)} روز پیش"
                         elif hours > 0:
@@ -341,17 +458,24 @@ def fetch_political_news():
                         else:
                             time_ago_str = f"{to_persian_num(minutes)} دقیقه پیش"
 
-                    news.append({
-                        "title": title,
-                        "link": entry.link,
-                        "source": name,
-                        "time_ago": time_ago_str
-                    })
+                    category, emoji = classify_political_news(title, name)
+
+                    news.append(
+                        {
+                            "title": title,
+                            "link": entry.link,
+                            "source": name,
+                            "time_ago": time_ago_str,
+                            "category": category,
+                            "category_emoji": emoji,
+                        }
+                    )
                     seen.add(title_key)
+            logger.info(f"Fetched news from {name}")
         except Exception as e:
-            print(f"Warning: Failed to parse feed '{name}': {e}")
+            logger.warning(f"Failed to parse feed '{name}': {e}")
             continue
-    return news[:12]
+    return news[:15]
 
 
 # ─── AI Summary ──────────────────────────────────────────────────────────────
@@ -359,23 +483,33 @@ def get_ai_summary(news_list):
     if not news_list:
         return "خبر سیاسی مهمی یافت نشد."
 
-    formatted_news = "\n".join(
-        f"- {n['title']} (Source: {n['source']}, Time Ago: {n['time_ago']}, Link: {n['link']})"
-        for n in news_list
-    )
+    # Group news by category
+    grouped = {}
+    for n in news_list:
+        cat = n["category"]
+        grouped.setdefault(cat, []).append(n)
+
+    formatted_news = ""
+    for cat_name, items in grouped.items():
+        formatted_news += f"\n=== CATEGORY: {cat_name} ===\n"
+        for n in items:
+            formatted_news += f"- {n['title']} (Source: {n['source']}, Time Ago: {n['time_ago']}, Link: {n['link']})\n"
 
     prompt = f"""You are an expert news curator. Summarize these Iranian political news items for a Telegram channel.
+The news items are already grouped by category. PRESERVE these category groupings in your output.
 Tone: VERY casual, friendly, conversational Persian (خودمونی).
 Rules:
 1. Summarize EACH item in exactly 1 short line.
 2. At the end of EACH line, include the time ago info provided (e.g., ۲ ساعت پیش).
 3. Format using HTML tags:
+   Use category headers like: <b>[emoji] [category name]</b>
+   Then each item:
    <b>• [خلاصه خبر]</b> ([زمان])
    🔗 <a href="[LINK]">منبع: [نام منبع]</a>
 4. Use Persian numerals for numbers.
 5. Keep it engaging.
 
-News Items:
+News Items (grouped by category):
 {formatted_news}
 """
     try:
@@ -385,6 +519,7 @@ News Items:
         else:
             return "⚠️ پاسخ هوش مصنوعی خالی بود."
     except Exception as e:
+        logger.error(f"Gemini API error: {e}")
         return f"خطا در پردازش هوش مصنوعی: {e}"
 
 
@@ -412,21 +547,42 @@ def send_to_telegram(text):
             "disable_web_page_preview": True,
         }
         try:
-            resp = requests.post(url, json=payload, timeout=30)
+            resp = http_session.post(url, json=payload, timeout=30)
             if resp.status_code != 200:
-                print(f"Telegram API error on chunk {i+1}/{len(chunks)}: {resp.status_code} — {resp.text}")
+                logger.error(
+                    f"Telegram API error on chunk {i+1}/{len(chunks)}: "
+                    f"{resp.status_code} — {resp.text[:200]}"
+                )
+            else:
+                logger.info(f"Message part {i+1}/{len(chunks)}: sent OK")
             if i < len(chunks) - 1:
                 time.sleep(1)
-        except Exception as e:
-            print(f"Failed to send Telegram message: {e}")
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Failed to send Telegram message: {e}")
 
 
 # ─── Main ────────────────────────────────────────────────────────────────────
 def main():
-    print("Aggregating markets and news...")
+    logger.info("=" * 50)
+    logger.info("  Financial & Political News Bot")
+    logger.info("=" * 50)
+
+    logger.info("Aggregating markets and news...")
     financial_msg = get_financial_section()
+
     news_items = fetch_political_news()
-    print(f"Found {len(news_items)} news items.")
+    logger.info(f"Found {len(news_items)} news items.")
+
+    # Log category stats
+    stats = {}
+    for item in news_items:
+        cat = item["category"]
+        stats[cat] = stats.get(cat, 0) + 1
+    if stats:
+        logger.info("News category breakdown:")
+        for cat, count in sorted(stats.items(), key=lambda x: x[1], reverse=True):
+            logger.info(f"  {cat}: {count} items")
+
     news_summary = get_ai_summary(news_items)
 
     final_message = (
@@ -436,7 +592,8 @@ def main():
     )
 
     send_to_telegram(final_message)
-    print("Task completed successfully.")
+    logger.info("Task completed successfully.")
+
 
 if __name__ == "__main__":
     main()
