@@ -1,14 +1,29 @@
 import os
 import sys
 import json
+import logging
+import socket
 from datetime import datetime, timezone
 
-import socket
 import feedparser
 import google.generativeai as genai
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
+# ============================================
+# Logging Setup
+# ============================================
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+logger = logging.getLogger(__name__)
 
+# ============================================
+# Proxy Detection
+# ============================================
 def _proxy_is_available(host="127.0.0.1", port=10808, timeout=1):
     """Check if a proxy is actually reachable before using it."""
     try:
@@ -22,9 +37,23 @@ def _proxy_is_available(host="127.0.0.1", port=10808, timeout=1):
 if _proxy_is_available():
     os.environ["HTTPS_PROXY"] = "http://127.0.0.1:10808"
     os.environ["HTTP_PROXY"] = "http://127.0.0.1:10808"
+    logger.info("Proxy detected at 127.0.0.1:10808 — using it")
 else:
     os.environ.pop("HTTPS_PROXY", None)
     os.environ.pop("HTTP_PROXY", None)
+    logger.info("No proxy detected — connecting directly")
+
+# ============================================
+# HTTP Session with Retry
+# ============================================
+http_session = requests.Session()
+retry_strategy = Retry(
+    total=3,
+    backoff_factor=1,
+    status_forcelist=[429, 500, 502, 503, 504],
+)
+http_session.mount("https://", HTTPAdapter(max_retries=retry_strategy))
+http_session.mount("http://", HTTPAdapter(max_retries=retry_strategy))
 
 # ============================================
 # Configuration
@@ -46,7 +75,7 @@ if not all([GEMINI_API_KEY, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID]):
         TELEGRAM_CHAT_ID = cfg.get("telegram_chat_id", TELEGRAM_CHAT_ID)
 
 if not all([GEMINI_API_KEY, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID]):
-    print("ERROR: Missing configuration. Please fill in config.json")
+    logger.error("Missing configuration. Please fill in config.json or set env vars.")
     sys.exit(1)
 
 # ============================================
@@ -62,22 +91,107 @@ FEEDS = [
     "https://venturebeat.com/category/ai/feed/",
     "https://arstechnica.com/tag/artificial-intelligence/feed/",
     "https://www.theverge.com/rss/ai-artificial-intelligence/index.xml",
-    "https://feeds.feedburner.com/GoogleAIBlog", # Google AI Blog
-    "https://huggingface.co/blog/feed.xml", # Hugging Face Blog
-    "https://openai.com/blog/rss.xml", # OpenAI Blog
+    "https://feeds.feedburner.com/GoogleAIBlog",
+    "https://huggingface.co/blog/feed.xml",
+    "https://openai.com/blog/rss.xml",
     # AI Agents & Tools specific
     "https://www.marktechpost.com/feed/",
     "https://syncedreview.com/feed/",
 ]
 
 genai.configure(api_key=GEMINI_API_KEY)
-model = genai.GenerativeModel('gemini-3.1-flash-lite')
+model = genai.GenerativeModel("gemini-3.1-flash-lite")
+
+# ============================================
+# News Category Classification (Keyword-Based)
+# ============================================
+CATEGORIES = {
+    "🛠️ ابزارها و محصولات جدید": {
+        "keywords": [
+            "launch", "release", "announce", "tool", "app", "platform",
+            "product", "feature", "update", "api", "sdk", "plugin",
+            "integration", "service", "deploy", "chatbot", "assistant",
+            "copilot", "agent", "framework", "library", "open-source",
+            "opens", "introduces", "unveils", "debuts", "rolls out",
+            "now available", "beta", "preview", "generally available",
+        ],
+        "emoji": "🛠️",
+    },
+    "📄 مقالات پژوهشی": {
+        "keywords": [
+            "research", "paper", "study", "arxiv", "findings", "experiment",
+            "benchmark", "dataset", "model", "training", "fine-tune",
+            "transformer", "neural", "architecture", "algorithm",
+            "breakthrough", "novel", "propose", "evaluate", "sota",
+            "state-of-the-art", "preprint", "peer-review", "journal",
+            "conference", "icml", "neurips", "iclr", "cvpr", "aaai",
+            "acl", "emnlp", "published", "researchers",
+        ],
+        "emoji": "📄",
+    },
+    "🏢 اخبار شرکت‌ها": {
+        "keywords": [
+            "google", "openai", "microsoft", "meta", "amazon", "apple",
+            "nvidia", "anthropic", "mistral", "deepmind", "stability",
+            "hugging face", "cohere", "databricks", "salesforce",
+            "ibm", "intel", "amd", "tesla", "samsung", "baidu",
+            "alibaba", "tencent", "xai", "startup", "funding",
+            "acquisition", "partnership", "hire", "layoff", "ceo",
+            "valuation", "ipo", "revenue", "investment", "series",
+            "billion", "million", "deal", "merge",
+        ],
+        "emoji": "🏢",
+    },
+    "⚖️ قوانین و اخلاق هوش مصنوعی": {
+        "keywords": [
+            "regulation", "law", "policy", "ethics", "bias", "safety",
+            "alignment", "governance", "ban", "restrict", "compliance",
+            "copyright", "privacy", "gdpr", "eu ai act", "senate",
+            "congress", "legislation", "lawsuit", "court", "legal",
+            "responsible", "transparency", "accountability", "risk",
+            "deepfake", "misinformation", "disinformation",
+        ],
+        "emoji": "⚖️",
+    },
+    "🤖 کاربردهای هوش مصنوعی": {
+        "keywords": [
+            "healthcare", "medical", "diagnosis", "drug", "climate",
+            "education", "autonomous", "self-driving", "robotics",
+            "manufacturing", "agriculture", "finance", "art",
+            "music", "video", "image", "generation", "creative",
+            "gaming", "security", "cybersecurity", "military",
+            "defense", "space", "energy", "transportation",
+        ],
+        "emoji": "🤖",
+    },
+}
 
 
+def classify_news(title, summary):
+    """Classify a news item into a category using keyword matching.
+
+    Returns (category_name, emoji) or ("📰 سایر اخبار", "📰") as fallback.
+    """
+    text = f"{title} {summary}".lower()
+    scores = {}
+    for cat_name, cat_info in CATEGORIES.items():
+        score = sum(1 for kw in cat_info["keywords"] if kw in text)
+        if score > 0:
+            scores[cat_name] = score
+
+    if scores:
+        best = max(scores, key=scores.get)
+        return best, CATEGORIES[best]["emoji"]
+    return "📰 سایر اخبار", "📰"
+
+
+# ============================================
+# Feed Fetching
+# ============================================
 def get_days_ago(entry):
     """Calculate how many days ago a news item was published."""
     now = datetime.now(timezone.utc)
-    if hasattr(entry, 'published_parsed') and entry.published_parsed:
+    if hasattr(entry, "published_parsed") and entry.published_parsed:
         pub_date = datetime(*entry.published_parsed[:6], tzinfo=timezone.utc)
         delta = now - pub_date
         days = delta.days
@@ -94,13 +208,14 @@ def get_days_ago(entry):
 
 
 def fetch_news():
-    """Fetch news from all RSS feeds with dates."""
+    """Fetch news from all RSS feeds with dates and categories."""
     news_items = []
     seen_titles = set()
 
     for url in FEEDS:
         try:
             feed = feedparser.parse(url)
+            source_name = feed.feed.get("title", url)
             for entry in feed.entries[:8]:
                 title = entry.title.strip()
                 # Skip duplicates
@@ -111,29 +226,60 @@ def fetch_news():
 
                 days_ago = get_days_ago(entry)
                 summary = ""
-                if hasattr(entry, 'summary'):
+                if hasattr(entry, "summary"):
                     summary = entry.summary[:300]
-                elif hasattr(entry, 'description'):
+                elif hasattr(entry, "description"):
                     summary = entry.description[:300]
 
-                news_items.append({
-                    "title": title,
-                    "summary": summary,
-                    "days_ago": days_ago,
-                    "source": feed.feed.get("title", url)
-                })
-        except Exception as e:
-            print(f"  [WARN] Skipping {url}: {e}")
+                category, emoji = classify_news(title, summary)
 
+                news_items.append(
+                    {
+                        "title": title,
+                        "summary": summary,
+                        "days_ago": days_ago,
+                        "source": source_name,
+                        "category": category,
+                        "category_emoji": emoji,
+                    }
+                )
+            logger.info(f"Fetched {min(8, len(feed.entries))} items from {source_name}")
+        except Exception as e:
+            logger.warning(f"Skipping {url}: {e}")
+
+    logger.info(f"Total unique items: {len(news_items)}")
     return news_items
 
 
+# ============================================
+# Category Statistics
+# ============================================
+def get_category_stats(news_items):
+    """Return a dict of category -> count."""
+    stats = {}
+    for item in news_items:
+        cat = item["category"]
+        stats[cat] = stats.get(cat, 0) + 1
+    return stats
+
+
+# ============================================
+# AI Translation & Formatting
+# ============================================
 def translate_and_format(news_items):
-    """Use Gemini to translate and format news in Persian with HTML."""
+    """Use Gemini to translate and format news in Persian with HTML, grouped by category."""
+    # Group items by category
+    grouped = {}
+    for item in news_items:
+        cat = item["category"]
+        grouped.setdefault(cat, []).append(item)
+
     # Build structured input for Gemini
     items_text = ""
-    for i, item in enumerate(news_items, 1):
-        items_text += f"""
+    for cat_name, items in grouped.items():
+        items_text += f"\n=== CATEGORY: {cat_name} ===\n"
+        for i, item in enumerate(items, 1):
+            items_text += f"""
 --- Item {i} ---
 Title: {item['title']}
 Published: {item['days_ago']}
@@ -143,38 +289,54 @@ Summary: {item['summary']}
 
     prompt = f"""You are an expert AI news curator and translator.
 
-Take the following English AI news items and create a Persian news digest.
+Take the following English AI news items (already grouped by category) and create a Persian news digest.
 
 RULES:
-1. Select the TOP 10 to 15 most important/interesting news items.
+1. Select the TOP 10 to 15 most important/interesting news items across all categories.
 2. Translate everything into natural, fluent Persian.
 3. You MUST use Telegram HTML formatting (NOT markdown). Use these tags ONLY:
-   - <b>bold text</b> for headlines
+   - <b>bold text</b> for headlines and category headers
    - <i>italic</i> for emphasis
    - No other HTML tags
 4. For each news item, include the "published" time (e.g. "۲ روز پیش" for "2 days ago").
 5. Add a source name in parentheses at the end of each item.
 6. Use numbered list format (۱. ۲. ۳. ... use Persian numerals).
 7. Keep each item concise: headline + 1-2 sentence summary + time + source.
-8. Start with a header line like: <b>📰 آخرین اخبار هوش مصنوعی</b>
+8. Start with a header line: <b>📰 آخرین اخبار هوش مصنوعی</b>
+9. GROUP the news by their categories. Use the category name (with its emoji) as a section header.
+   For example:
+   <b>🛠️ ابزارها و محصولات جدید</b>
+   ۱. ...
+   ۲. ...
+   
+   <b>📄 مقالات پژوهشی</b>
+   ۳. ...
 
-Here are the news items:
+Here are the news items grouped by category:
 
 {items_text}
 """
 
-    response = model.generate_content(prompt)
-    return response.text
+    try:
+        response = model.generate_content(prompt)
+        return response.text
+    except Exception as e:
+        logger.error(f"Gemini API error: {e}")
+        return f"⚠️ خطا در ارتباط با Gemini: {e}"
 
 
+# ============================================
+# Telegram Sender
+# ============================================
 def send_telegram(message):
-    """Send message to Telegram using HTML parse mode."""
+    """Send message to Telegram using HTML parse mode with retry."""
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    # Telegram message limit is 4096 chars
-    # If message is too long, split it
+    # Telegram message limit is 4096 chars — split if needed
     chunks = []
     while len(message) > 4096:
-        split_point = message[:4096].rfind('\n\n')
+        split_point = message[:4096].rfind("\n\n")
+        if split_point == -1:
+            split_point = message[:4096].rfind("\n")
         if split_point == -1:
             split_point = 4096
         chunks.append(message[:split_point])
@@ -182,47 +344,60 @@ def send_telegram(message):
     chunks.append(message)
 
     results = []
-    for chunk in chunks:
+    for i, chunk in enumerate(chunks):
         payload = {
             "chat_id": TELEGRAM_CHAT_ID,
             "text": chunk,
             "parse_mode": "HTML",
-            "disable_web_page_preview": True
+            "disable_web_page_preview": True,
         }
-        resp = requests.post(url, json=payload)
-        results.append((resp.status_code, resp.text))
+        try:
+            resp = http_session.post(url, json=payload, timeout=30)
+            results.append((resp.status_code, resp.text))
+            if resp.status_code == 200:
+                logger.info(f"Message part {i+1}/{len(chunks)}: sent OK")
+            else:
+                logger.error(f"Message part {i+1}/{len(chunks)}: {resp.status_code} — {resp.text[:200]}")
+        except requests.RequestException as e:
+            logger.error(f"Failed to send message part {i+1}: {e}")
+            results.append((0, str(e)))
+
     return results
 
 
+# ============================================
+# Main
+# ============================================
 def main():
-    print("=" * 50)
-    print("  AI News Bot - Daily Persian Digest")
-    print("=" * 50)
+    logger.info("=" * 50)
+    logger.info("  AI News Bot — Daily Persian Digest")
+    logger.info("=" * 50)
 
-    print("\n[1/3] Fetching AI news from RSS feeds...")
+    logger.info("[1/3] Fetching AI news from RSS feeds...")
     news_items = fetch_news()
-    print(f"  -> Found {len(news_items)} unique news items from {len(FEEDS)} sources")
+    logger.info(f"Found {len(news_items)} unique news items from {len(FEEDS)} sources")
 
     if not news_items:
-        print("ERROR: No news items fetched. Check your internet connection.")
+        logger.error("No news items fetched. Check your internet connection.")
         sys.exit(1)
 
-    print("\n[2/3] Translating and formatting with Gemini 3.1 Flash Lite...")
-    summary = translate_and_format(news_items)
-    print(f"  -> Got summary ({len(summary)} chars)")
+    # Log category stats
+    stats = get_category_stats(news_items)
+    logger.info("Category breakdown:")
+    for cat, count in sorted(stats.items(), key=lambda x: x[1], reverse=True):
+        logger.info(f"  {cat}: {count} items")
 
-    print("\n[3/3] Sending to Telegram...")
+    logger.info("[2/3] Translating and formatting with Gemini...")
+    summary = translate_and_format(news_items)
+    logger.info(f"Got summary ({len(summary)} chars)")
+
+    logger.info("[3/3] Sending to Telegram...")
     results = send_telegram(summary)
-    for i, (status, body) in enumerate(results):
-        if status == 200:
-            print(f"  -> Part {i+1}: OK")
-        else:
-            print(f"  -> Part {i+1}: FAILED ({status}): {body[:200]}")
 
     if all(s == 200 for s, _ in results):
-        print("\nSUCCESS! Check your Telegram for the news digest.")
+        logger.info("SUCCESS! Check your Telegram for the news digest.")
     else:
-        print("\nSome parts failed to send. Check the errors above.")
+        logger.warning("Some parts failed to send. Check the errors above.")
 
 
 if __name__ == "__main__":
